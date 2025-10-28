@@ -1,0 +1,12 @@
+/data/chromadb
+/data/origin/
+*.bak
+cleanup.py
+merge.py
+
+__pycache__/
+*.pyc
+.env
+.vscode/
+.idea/
+.DS_Store

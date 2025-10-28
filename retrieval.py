@@ -1,0 +1,164 @@
+import torch
+import chromadb
+import os
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from tqdm import tqdm
+
+# Tắt cảnh báo không cần thiết
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# --- CONFIGURATION ---
+DATA_DIR = "./data"
+CHROMA_DB_PATH = os.path.join(DATA_DIR, "chromadb")
+EMBEDDING_MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"
+RERANKER_MODEL_NAME = "Qwen/Qwen3-Reranker-0.6B"
+
+# --- HELPER FUNCTIONS (Internal to this module) ---
+
+def _format_instruction(instruction, query, doc):
+    return f"<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {doc}"
+
+def _process_inputs_optimized(pairs, tokenizer, prefix, suffix, max_length):
+    processed_pairs = [prefix + pair_text + suffix for pair_text in pairs]
+    return tokenizer(
+        processed_pairs,
+        padding='max_length',
+        truncation=True,
+        max_length=max_length,
+        return_tensors="pt"
+    )
+
+@torch.no_grad()
+def _compute_logits(model, inputs, token_true_id, token_false_id):
+    for key in inputs:
+        inputs[key] = inputs[key].to(model.device)
+    batch_scores = model(**inputs).logits[:, -1, :]
+    true_vector = batch_scores[:, token_true_id]
+    false_vector = batch_scores[:, token_false_id]
+    batch_scores = torch.stack([false_vector, true_vector], dim=1)
+    batch_scores = torch.nn.functional.log_softmax(batch_scores, dim=1)
+    return batch_scores[:, 1].exp().tolist()
+
+# --- PUBLIC FUNCTIONS (To be imported by app.py) ---
+
+def setup_device():
+    """Tự động nhận diện và trả về thiết bị tốt nhất có sẵn (GPU/CPU)."""
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        print("Using device: CUDA (NVIDIA GPU)")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("Using device: MPS (Apple Silicon GPU)")
+    else:
+        device = torch.device("cpu")
+        print("Using device: CPU")
+    return device
+
+def load_embedding_model():
+    """Tải và trả về mô hình embedding."""
+    print("Loading embedding model...")
+    return SentenceTransformer(EMBEDDING_MODEL_NAME, trust_remote_code=True)
+
+def load_reranker_data(device):
+    """Tải mô hình reranker, tokenizer và các cấu hình cần thiết."""
+    print("Loading reranker model and data...")
+    tokenizer = AutoTokenizer.from_pretrained(RERANKER_MODEL_NAME, padding_side='left')
+    model = AutoModelForCausalLM.from_pretrained(
+        RERANKER_MODEL_NAME, 
+        dtype=torch.float16
+    ).to(device).eval()
+    
+    prefix = "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n"
+    suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    
+    return {
+        "model": model, "tokenizer": tokenizer,
+        "token_false_id": tokenizer.convert_tokens_to_ids("no"),
+        "token_true_id": tokenizer.convert_tokens_to_ids("yes"),
+        "max_length": 512, "prefix": prefix, "suffix": suffix,
+    }
+
+def perform_retrieval_and_reranking(query: str, embedding_model, reranker_data: dict):
+    """
+    Hàm chính thực hiện toàn bộ quy trình: embedding, retrieval và reranking.
+    Hàm này được thiết kế để app.py gọi.
+    """
+    # 1. Kết nối DB
+    chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+    products_collection = chroma_client.get_collection(name="products")
+    prebuilt_collection = chroma_client.get_collection(name="prebuilt_pcs")
+
+    # 2. Tạo query embedding
+    query_embedding = embedding_model.encode(query, prompt_name="query")
+    
+    # 3. Truy xuất ban đầu
+    num_candidates = 20
+    results_products = products_collection.query(query_embeddings=[query_embedding.tolist()], n_results=num_candidates)
+    results_prebuilt = prebuilt_collection.query(query_embeddings=[query_embedding.tolist()], n_results=num_candidates)
+    initial_documents = results_products['documents'][0] + results_prebuilt['documents'][0]
+    initial_metadatas = results_products['metadatas'][0] + results_prebuilt['metadatas'][0]
+    
+    if not initial_documents:
+        return "No relevant information found."
+
+    # 4. Rerank tài liệu
+    task_instruction = 'Given a user query about computer components or pre-built PCs, determine if the following document is relevant.'
+    rerank_pairs = [_format_instruction(task_instruction, query, doc) for doc in initial_documents]
+    
+    all_scores = []
+    batch_size = 4
+    for i in range(0, len(rerank_pairs), batch_size):
+        batch_pairs = rerank_pairs[i:i + batch_size]
+        inputs = _process_inputs_optimized(
+            batch_pairs, reranker_data["tokenizer"], 
+            reranker_data["prefix"], reranker_data["suffix"], reranker_data["max_length"]
+        )
+        scores = _compute_logits(
+            model=reranker_data["model"], inputs=inputs, 
+            token_true_id=reranker_data["token_true_id"], token_false_id=reranker_data["token_false_id"]
+        )
+        all_scores.extend(scores)
+    
+    # 5. Định dạng kết quả cuối cùng
+    results_with_scores = sorted(list(zip(all_scores, initial_metadatas)), key=lambda x: x[0], reverse=True)
+    
+    top_n_reranked = 5
+    reranked_context = []
+    for score, meta in results_with_scores[:top_n_reranked]:
+        if 'Tên sản phẩm' in meta:
+            reranked_context.append(f"Product: {meta.get('Tên sản phẩm', 'N/A')} - Price: {meta.get('Giá', 'N/A')} VND")
+        elif 'Nhu cầu' in meta:
+            pc_details = [
+                f"Prebuilt PC for {meta.get('Nhu cầu', 'N/A')}",
+                f"CPU: {meta.get('Hãng CPU', '')} {meta.get('CPU', '')}",
+                f"MAIN: {meta.get('MAIN', '')}",
+                f"RAM: {meta.get('RAM', '')}",
+                f"VGA: {meta.get('VGA', '')}",
+                f"Storage: {meta.get('Storage', '')}",
+                f"Price: {meta.get('PRICE', 'N/A')}"
+            ]
+            reranked_context.append(" - ".join(filter(None, pc_details)))
+
+    return "\n".join(reranked_context) if reranked_context else "No relevant information found."
+
+
+# # --- TEST BLOCK ---
+# # Phần này chỉ chạy khi bạn thực thi `python retrieval.py` trực tiếp
+# if __name__ == "__main__":
+#     print("--- RUNNING IN TEST MODE ---")
+    
+#     # Tải mô hình và dữ liệu cần thiết
+#     test_device = setup_device()
+#     test_embedding_model = load_embedding_model()
+#     test_reranker_data = load_reranker_data(test_device)
+    
+#     # Thực hiện retrieval và reranking
+#     SAMPLE_QUERY = "RTX 5060"
+#     print(f"\nTesting with query: '{SAMPLE_QUERY}'")
+#     final_context = perform_retrieval_and_reranking(SAMPLE_QUERY, test_embedding_model, test_reranker_data)
+    
+#     # In kết quả
+#     print("\n--- TEST RESULTS ---")
+#     print(final_context)
+#     print("\n--- TEST COMPLETE ---")

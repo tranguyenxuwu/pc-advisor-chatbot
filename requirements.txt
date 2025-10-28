@@ -1,0 +1,9 @@
+streamlit
+openai
+chromadb
+sentence-transformers
+transformers
+pandas
+numpy
+tqdm
+accelerate
