@@ -5,6 +5,81 @@ from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from tqdm import tqdm
 
+# --- PRICE-FIRST UTILITIES ---
+import re as _re_price
+
+_VND_NUM_RE = _re_price.compile(r'(?<!\d)(\d{1,3}(?:[._ ]?\d{3})+|\d{5,})(?!\d)')  # 30.000.000 | 30000000
+_TRIEU_RE = _re_price.compile(r'(?<!\w)(\d+(?:[.,]\d+)?)\s*(tr|triệu|m)(?!\w)', _re_price.IGNORECASE)
+
+def _digits_only_price(s: str) -> int | None:
+    nums = _re_price.findall(r'\d+', s or '')
+    if not nums:
+        return None
+    try:
+        return int(''.join(nums))
+    except Exception:
+        return None
+
+def extract_budget_vnd(text: str) -> int | None:
+    """Tìm ngân sách từ query: hỗ trợ '30000000', '30.000.000', '30tr/triệu/m'."""
+    if not text:
+        return None
+    m = _TRIEU_RE.search(text)
+    if m:
+        try:
+            amt = float(m.group(1).replace(',', '.'))
+            return int(round(amt * 1_000_000))
+        except Exception:
+            pass
+    cleaned = text.replace(',', '.').replace('đ', '').replace('vnd', '').lower()
+    m2 = _VND_NUM_RE.search(cleaned)
+    if m2:
+        try:
+            n = int(_re_price.sub(r'[._ ]', '', m2.group(1)))
+            return n if n >= 10_000 else None
+        except Exception:
+            return None
+    return None
+
+def parse_price_from_meta(meta) -> int | None:
+    """Trả về giá (VND) từ metadata: ưu tiên PRICE_NUM, fallback parse PRICE (chuỗi)."""
+    if not meta:
+        return None
+    try:
+        if 'PRICE_NUM' in meta and isinstance(meta['PRICE_NUM'], (int, float)):
+            return int(meta['PRICE_NUM'])
+    except Exception:
+        pass
+    val = (meta or {}).get('PRICE')
+    if not val:
+        return None
+    m = _TRIEU_RE.search(str(val))
+    if m:
+        try:
+            amt = float(m.group(1).replace(',', '.'))
+            return int(round(amt * 1_000_000))
+        except Exception:
+            return None
+    n = _digits_only_price(str(val))
+    if n and n >= 10_000:
+        return n
+    return None
+
+def price_closeness(budget: int, price: int, tolerance: float = 0.30) -> float:
+    """Điểm 0..1: 1 khi sát ngân sách, giảm tuyến tính tới 0 ở |Δ| = tolerance*budget."""
+    if not budget or not price:
+        return 0.0
+    diff = abs(price - budget) / max(1, budget)
+    score = max(0.0, 1.0 - diff / max(1e-6, tolerance))
+    return float(score)
+
+def augment_doc_with_meta(doc: str, meta: dict, price: int | None) -> str:
+    """Bơm metadata (PRICE, Nhu cầu) vào văn bản để reranker 'nhìn' được giá."""
+    use_case = (meta or {}).get('Nhu cầu', 'N/A')
+    price_str = f"{price}" if price is not None else str((meta or {}).get('PRICE', 'N/A'))
+    header = f"[PRICE_VND={price_str}] [USE_CASE={use_case}]"
+    return f"{header}\n{doc}"
+
 # Tắt cảnh báo không cần thiết
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -79,86 +154,119 @@ def load_reranker_data(device):
         "max_length": 512, "prefix": prefix, "suffix": suffix,
     }
 
-def perform_retrieval_and_reranking(query: str, embedding_model, reranker_data: dict):
-    """
-    Hàm chính thực hiện toàn bộ quy trình: embedding, retrieval và reranking.
-    Hàm này được thiết kế để app.py gọi.
-    """
-    # 1. Kết nối DB
-    chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-    products_collection = chroma_client.get_collection(name="products")
-    prebuilt_collection = chroma_client.get_collection(name="prebuilt_pcs")
-
-    # 2. Tạo query embedding
-    query_embedding = embedding_model.encode(query, prompt_name="query")
+def rerank_documents(reranker_data, query, documents, batch_size=4, task_instruction=None):
+    model = reranker_data["model"]
+    tokenizer = reranker_data["tokenizer"]
+    task_instruction = task_instruction or 'Given a user query about pre-built PCs, determine if the following document is relevant.'
     
-    # 3. Truy xuất ban đầu
-    num_candidates = 20
-    results_products = products_collection.query(query_embeddings=[query_embedding.tolist()], n_results=num_candidates)
-    results_prebuilt = prebuilt_collection.query(query_embeddings=[query_embedding.tolist()], n_results=num_candidates)
-    initial_documents = results_products['documents'][0] + results_prebuilt['documents'][0]
-    initial_metadatas = results_products['metadatas'][0] + results_prebuilt['metadatas'][0]
-    
-    if not initial_documents:
-        return "No relevant information found."
-
-    # 4. Rerank tài liệu
-    task_instruction = 'Given a user query about computer components or pre-built PCs, determine if the following document is relevant.'
-    rerank_pairs = [_format_instruction(task_instruction, query, doc) for doc in initial_documents]
+    rerank_pairs = [_format_instruction(task_instruction, query, doc) for doc in documents]
     
     all_scores = []
-    batch_size = 4
-    for i in range(0, len(rerank_pairs), batch_size):
+    for i in tqdm(range(0, len(rerank_pairs), batch_size), desc="Reranking Batches"):
         batch_pairs = rerank_pairs[i:i + batch_size]
         inputs = _process_inputs_optimized(
-            batch_pairs, reranker_data["tokenizer"], 
-            reranker_data["prefix"], reranker_data["suffix"], reranker_data["max_length"]
+            batch_pairs, tokenizer, 
+            reranker_data["prefix"], 
+            reranker_data["suffix"], 
+            reranker_data["max_length"]
         )
         scores = _compute_logits(
-            model=reranker_data["model"], inputs=inputs, 
-            token_true_id=reranker_data["token_true_id"], token_false_id=reranker_data["token_false_id"]
+            model, inputs, 
+            reranker_data["token_true_id"], 
+            reranker_data["token_false_id"]
         )
         all_scores.extend(scores)
-    
-    # 5. Định dạng kết quả cuối cùng
-    results_with_scores = sorted(list(zip(all_scores, initial_metadatas)), key=lambda x: x[0], reverse=True)
-    
-    top_n_reranked = 5
+        
+    return all_scores
+
+def perform_retrieval_and_reranking(query: str, embedding_model, reranker_data: dict):
+    """
+    Hàm chính thực hiện embedding → retrieval → reranking với ưu tiên GIÁ (PRICE).
+    """
+    # 1) Kết nối DB
+    chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+    prebuilt_collection = chroma_client.get_collection(name="prebuilt_pcs")
+
+    # 2) Tạo query embedding
+    query_embedding = embedding_model.encode(query, prompt_name="query")
+
+    # 3) Tách ngân sách từ query (nếu có) và retrieval ưu tiên giá
+    budget = extract_budget_vnd(query)
+    num_candidates = 50
+    results_prebuilt = None
+    if budget:
+        lower = int(budget * 0.70)
+        upper = int(budget * 1.30)
+        try:
+            results_prebuilt = prebuilt_collection.query(
+                query_embeddings=[query_embedding.tolist()],
+                n_results=num_candidates,
+                where={"PRICE_NUM": {"$gte": lower, "$lte": upper}},
+            )
+            # Fallback nếu không có kết quả
+            if not results_prebuilt or not results_prebuilt.get("documents") or not results_prebuilt["documents"][0]:
+                results_prebuilt = None
+        except Exception:
+            results_prebuilt = None
+
+    if results_prebuilt is None:
+        results_prebuilt = prebuilt_collection.query(
+            query_embeddings=[query_embedding.tolist()], n_results=num_candidates
+        )
+
+    initial_documents = results_prebuilt['documents'][0]
+    initial_metadatas = results_prebuilt['metadatas'][0]
+
+    # 4) Chuẩn bị tài liệu cho rerank & điểm giá
+    augmented_docs, price_scores = [], []
+    for doc, meta in zip(initial_documents, initial_metadatas):
+        p = parse_price_from_meta(meta)
+        augmented_docs.append(augment_doc_with_meta(doc, meta, p))
+        if budget and p:
+            price_scores.append(price_closeness(budget, p, tolerance=0.30))
+        elif budget and not p:
+            price_scores.append(0.1)  # không có giá => phạt nhẹ
+        else:
+            price_scores.append(0.5)  # không có ngân sách => trung bình
+
+    # 5) Rerank với instruction ưu tiên GIÁ
+    if budget:
+        instruction = (
+            "Prioritize PRICE over use-case. Target budget is "
+            f"{budget} VND with tolerance ±30%. "
+            "Answer 'yes' ONLY if the document's price appears to be within the tolerance; "
+            "otherwise answer 'no' even if the use-case seems relevant."
+        )
+    else:
+        instruction = "User did not specify a budget. Judge general relevance to the PC query."
+
+    relevance_scores = rerank_documents(reranker_data, query, augmented_docs, batch_size=4, task_instruction=instruction)
+
+    # 6) Hợp nhất điểm với ưu tiên GIÁ
+    ALPHA_WEIGHT = 0.75
+    final = []
+    for meta, price_s, rel_s in zip(initial_metadatas, price_scores, relevance_scores):
+        combined = ALPHA_WEIGHT * price_s + (1.0 - ALPHA_WEIGHT) * rel_s
+        final.append((combined, price_s, rel_s, meta))
+    final_sorted = sorted(final, key=lambda x: x[0], reverse=True)
+
+    # 7) Kết xuất top-k theo ngữ cảnh chuỗi để hiển thị
+    top_n_reranked = 8
     reranked_context = []
-    for score, meta in results_with_scores[:top_n_reranked]:
-        if 'Tên sản phẩm' in meta:
-            reranked_context.append(f"Product: {meta.get('Tên sản phẩm', 'N/A')} - Price: {meta.get('Giá', 'N/A')} VND")
-        elif 'Nhu cầu' in meta:
-            pc_details = [
-                f"Prebuilt PC for {meta.get('Nhu cầu', 'N/A')}",
-                f"CPU: {meta.get('Hãng CPU', '')} {meta.get('CPU', '')}",
-                f"MAIN: {meta.get('MAIN', '')}",
-                f"RAM: {meta.get('RAM', '')}",
-                f"VGA: {meta.get('VGA', '')}",
-                f"Storage: {meta.get('Storage', '')}",
-                f"Price: {meta.get('PRICE', 'N/A')}"
-            ]
-            reranked_context.append(" - ".join(filter(None, pc_details)))
+    for i, (combined, p_s, r_s, meta) in enumerate(final_sorted[:top_n_reranked], start=1):
+        link_value = meta.get('LINK') or meta.get('LINK SP')
+        pc_details = [
+            f"#{i} Final={combined:.3f} | price={p_s:.3f} | rel={r_s:.3f}",
+            f"Prebuilt PC for {meta.get('Nhu cầu', 'N/A')}",
+            f"CPU: {meta.get('Hãng CPU', '')} {meta.get('CPU', '')}",
+            f"MAIN: {meta.get('MAIN', '')}",
+            f"RAM: {meta.get('RAM', '')}",
+            f"VGA: {meta.get('VGA', '')}",
+            f"Storage: {meta.get('Storage', '')}",
+            f"Price: {meta.get('PRICE', meta.get('PRICE_NUM', 'N/A'))}",
+            f"Link: {link_value or 'N/A'}",
+        ]
+        reranked_context.append(" - ".join(filter(None, pc_details)))
 
-    return "\n".join(reranked_context) if reranked_context else "No relevant information found."
-
-
-# # --- TEST BLOCK ---
-# # Phần này chỉ chạy khi bạn thực thi `python retrieval.py` trực tiếp
-# if __name__ == "__main__":
-#     print("--- RUNNING IN TEST MODE ---")
-    
-#     # Tải mô hình và dữ liệu cần thiết
-#     test_device = setup_device()
-#     test_embedding_model = load_embedding_model()
-#     test_reranker_data = load_reranker_data(test_device)
-    
-#     # Thực hiện retrieval và reranking
-#     SAMPLE_QUERY = "RTX 5060"
-#     print(f"\nTesting with query: '{SAMPLE_QUERY}'")
-#     final_context = perform_retrieval_and_reranking(SAMPLE_QUERY, test_embedding_model, test_reranker_data)
-    
-#     # In kết quả
-#     print("\n--- TEST RESULTS ---")
-#     print(final_context)
+    return "\\n".join(reranked_context) if reranked_context else "No relevant information found."
 #     print("\n--- TEST COMPLETE ---")

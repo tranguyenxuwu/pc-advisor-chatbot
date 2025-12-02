@@ -10,7 +10,6 @@ import numpy as np
 # --- CONFIGURATION ---
 DATA_DIR = "./data"
 CHROMA_DB_PATH = os.path.join(DATA_DIR, "chromadb")
-PARTS_CSV_PATH = os.path.join(DATA_DIR, "parts.csv")
 PREBUILT_CSV_PATH = os.path.join(DATA_DIR, "prebuilt-pc.csv")
 EMBEDDING_MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"
 
@@ -55,32 +54,14 @@ def main():
     model = load_model()
 
     # --- SETUP CHROMA DB ---
-    if not os.path.exists(PARTS_CSV_PATH) or not os.path.exists(PREBUILT_CSV_PATH):
+    if not os.path.exists(PREBUILT_CSV_PATH):
         print(f"Lỗi: Không tìm thấy file CSV trong thư mục '{DATA_DIR}'.")
-        print("Vui lòng đảm bảo 'data.csv' và 'prebuilt-pc.csv' tồn tại.")
+        print("Vui lòng đảm bảo 'prebuilt-pc.csv' tồn tại.")
         sys.exit(1)
 
     print(f"Initializing ChromaDB client at '{CHROMA_DB_PATH}'...")
     chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-    products_collection = chroma_client.get_or_create_collection(name="products")
     prebuilt_collection = chroma_client.get_or_create_collection(name="prebuilt_pcs")
-
-    # --- PROCESS PRODUCTS (data.csv) ---
-    print("\nProcessing component products from data.csv...")
-    products_documents, products_ids, products_metadatas = [], [], []
-    with open(PARTS_CSV_PATH, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        # Sử dụng tqdm cho CLI
-        for i, row in enumerate(tqdm(list(reader), desc="Reading products")):
-            doc = f"Danh mục: {row.get('Danh mục', '')}. Sản phẩm: {row.get('Tên sản phẩm', '')}. Giá: {row.get('Giá', '')} VND"
-            products_documents.append(doc)
-            products_ids.append(f"product_{i+1}")
-            products_metadatas.append(dict(row))
-
-    print(f"Generating embeddings for {len(products_documents)} products...")
-    products_embeddings = model.encode(products_documents, show_progress_bar=True)
-    products_collection.upsert(embeddings=products_embeddings.tolist(), documents=products_documents, ids=products_ids, metadatas=products_metadatas)
-    print(f"Successfully loaded {products_collection.count()} products into ChromaDB.")
 
     # --- PROCESS PRE-BUILT PCs (prebuilt-pc.csv) ---
     print("\nProcessing pre-built PCs from prebuilt-pc.csv...")
@@ -100,7 +81,10 @@ def main():
             doc = ". ".join(filter(None, doc_parts))
             prebuilt_documents.append(doc)
             prebuilt_ids.append(f"prebuilt_{i+1}")
-            prebuilt_metadatas.append(dict(row))
+            meta = dict(row)
+            link_value = meta.get('LINK') or meta.get('LINK SP') or ''
+            meta['LINK'] = link_value
+            prebuilt_metadatas.append(meta)
 
     print(f"Generating embeddings for {len(prebuilt_documents)} pre-built PCs...")
     prebuilt_embeddings = model.encode(prebuilt_documents, show_progress_bar=True)
@@ -108,8 +92,8 @@ def main():
     print(f"Successfully loaded {prebuilt_collection.count()} pre-built PCs into ChromaDB.")
     
     # Lưu trữ embeddings vào FAISS
-    all_documents = products_documents + prebuilt_documents
-    all_metadata = products_metadatas + prebuilt_metadatas
+    all_documents = prebuilt_documents
+    all_metadata = prebuilt_metadatas
 
     if not all_documents:
         print("No documents to process. Exiting.")
